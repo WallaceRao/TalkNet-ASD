@@ -1,5 +1,6 @@
 import sys, time, os, tqdm, torch, argparse, glob, subprocess, warnings, cv2, pickle, numpy, pdb, math, python_speech_features
 
+import gradio as gr
 from scipy import signal
 from shutil import rmtree
 from scipy.io import wavfile
@@ -14,6 +15,7 @@ from scenedetect.detectors import ContentDetector
 
 from model.faceDetector.s3fd import S3FD
 from talkNet import talkNet
+from deepface import DeepFace
 
 warnings.filterwarnings("ignore")
 
@@ -36,42 +38,44 @@ parser.add_argument('--duration',              type=int, default=0,  help='The d
 parser.add_argument('--evalCol',               dest='evalCol', action='store_true', help='Evaluate on Columnbia dataset')
 parser.add_argument('--colSavePath',           type=str, default="/data08/col",  help='Path for inputs, tmps and outputs')
 
-args = parser.parse_args()
+def init_args():
+	args = parser.parse_args()
 
-if os.path.isfile(args.pretrainModel) == False: # Download the pretrained model
-    Link = "1AbN9fCf9IexMxEKXLQY2KYBlb-IhSEea"
-    cmd = "gdown --id %s -O %s"%(Link, args.pretrainModel)
-    subprocess.call(cmd, shell=True, stdout=None)
+	if os.path.isfile(args.pretrainModel) == False: # Download the pretrained model
+		Link = "1AbN9fCf9IexMxEKXLQY2KYBlb-IhSEea"
+		cmd = "gdown --id %s -O %s"%(Link, args.pretrainModel)
+		subprocess.call(cmd, shell=True, stdout=None)
 
-if args.evalCol == True:
-	# The process is: 1. download video and labels(I have modified the format of labels to make it easiler for using)
-	# 	              2. extract audio, extract video frames
-	#                 3. scend detection, face detection and face tracking
-	#                 4. active speaker detection for the detected face clips
-	#                 5. use iou to find the identity of each face clips, compute the F1 results
-	# The step 1 to 3 will take some time (That is one-time process). It depends on your cpu and gpu speed. For reference, I used 1.5 hour
-	# The step 4 and 5 need less than 10 minutes
-	# Need about 20G space finally
-	# ```
-	args.videoName = 'col'
-	args.videoFolder = args.colSavePath
-	args.savePath = os.path.join(args.videoFolder, args.videoName)
-	args.videoPath = os.path.join(args.videoFolder, args.videoName + '.mp4')
-	args.duration = 0
-	if os.path.isfile(args.videoPath) == False:  # Download video
-		link = 'https://www.youtube.com/watch?v=6GzxbrO0DHM&t=2s'
-		cmd = "youtube-dl -f best -o %s '%s'"%(args.videoPath, link)
-		output = subprocess.call(cmd, shell=True, stdout=None)
-	if os.path.isdir(args.videoFolder + '/col_labels') == False: # Download label
-		link = "1Tto5JBt6NsEOLFRWzyZEeV6kCCddc6wv"
-		cmd = "gdown --id %s -O %s"%(link, args.videoFolder + '/col_labels.tar.gz')
-		subprocess.call(cmd, shell=True, stdout=None)
-		cmd = "tar -xzvf %s -C %s"%(args.videoFolder + '/col_labels.tar.gz', args.videoFolder)
-		subprocess.call(cmd, shell=True, stdout=None)
-		os.remove(args.videoFolder + '/col_labels.tar.gz')	
-else:
-	args.videoPath = glob.glob(os.path.join(args.videoFolder, args.videoName + '.*'))[0]
-	args.savePath = os.path.join(args.videoFolder, args.videoName)
+	if args.evalCol == True:
+		# The process is: 1. download video and labels(I have modified the format of labels to make it easiler for using)
+		# 	              2. extract audio, extract video frames
+		#                 3. scend detection, face detection and face tracking
+		#                 4. active speaker detection for the detected face clips
+		#                 5. use iou to find the identity of each face clips, compute the F1 results
+		# The step 1 to 3 will take some time (That is one-time process). It depends on your cpu and gpu speed. For reference, I used 1.5 hour
+		# The step 4 and 5 need less than 10 minutes
+		# Need about 20G space finally
+		# ```
+		args.videoName = 'col'
+		args.videoFolder = args.colSavePath
+		args.savePath = os.path.join(args.videoFolder, args.videoName)
+		args.videoPath = os.path.join(args.videoFolder, args.videoName + '.mp4')
+		args.duration = 0
+		if os.path.isfile(args.videoPath) == False:  # Download video
+			link = 'https://www.youtube.com/watch?v=6GzxbrO0DHM&t=2s'
+			cmd = "youtube-dl -f best -o %s '%s'"%(args.videoPath, link)
+			output = subprocess.call(cmd, shell=True, stdout=None)
+		if os.path.isdir(args.videoFolder + '/col_labels') == False: # Download label
+			link = "1Tto5JBt6NsEOLFRWzyZEeV6kCCddc6wv"
+			cmd = "gdown --id %s -O %s"%(link, args.videoFolder + '/col_labels.tar.gz')
+			subprocess.call(cmd, shell=True, stdout=None)
+			cmd = "tar -xzvf %s -C %s"%(args.videoFolder + '/col_labels.tar.gz', args.videoFolder)
+			subprocess.call(cmd, shell=True, stdout=None)
+			os.remove(args.videoFolder + '/col_labels.tar.gz')	
+	else:
+		args.videoPath = glob.glob(os.path.join(args.videoFolder, args.videoName + '.*'))[0]
+		args.savePath = os.path.join(args.videoFolder, args.videoName)
+	return args
 
 def scene_detect(args):
 	# CPU: Scene detection, output is the list of each shot's time duration
@@ -160,6 +164,19 @@ def track_shot(args, sceneFaces):
 				tracks.append({'frame':frameI,'bbox':bboxesI})
 	return tracks
 
+def face_similarity(args, tid1, tid2):
+	total_sim = 0.0
+	for face_id in range(3):
+		file_name1 = args.pycropPath + "/" + str(tid1) + "_" + str(face_id) + ".jpg"
+		file_name2 = args.pycropPath + "/" + str(tid2) + "_" + str(face_id) + ".jpg"
+		result = DeepFace.verify(
+			img1_path = file_name1,
+			img2_path = file_name2,
+		)
+		total_sim = total_sim + result['distance']
+	return total_sim / 3.0
+
+
 def crop_video(args, track, cropFile):
 	# CPU: crop the face clips
 	flist = glob.glob(os.path.join(args.pyframesPath, '*.jpg')) # Read the frames
@@ -173,6 +190,10 @@ def crop_video(args, track, cropFile):
 	dets['s'] = signal.medfilt(dets['s'], kernel_size=13)  # Smooth detections 
 	dets['x'] = signal.medfilt(dets['x'], kernel_size=13)
 	dets['y'] = signal.medfilt(dets['y'], kernel_size=13)
+	total_frames = len(track['frame'])
+	tid = track['tid']
+	face_id = 0
+	pick_indexs = [int(total_frames/4.0), 2 * int(total_frames/4.0), 3 * int(total_frames/4.0)]
 	for fidx, frame in enumerate(track['frame']):
 		cs  = args.cropScale
 		bs  = dets['s'][fidx]   # Detection box size
@@ -183,6 +204,10 @@ def crop_video(args, track, cropFile):
 		mx  = dets['x'][fidx] + bsi  # BBox center X
 		face = frame[int(my-bs):int(my+bs*(1+2*cs)),int(mx-bs*(1+cs)):int(mx+bs*(1+cs))]
 		vOut.write(cv2.resize(face, (224, 224)))
+		if fidx in pick_indexs:
+			file_name = args.pycropPath + "/" + str(tid) + "_" + str(face_id) + ".jpg"
+			cv2.imwrite(file_name, face)
+			face_id = face_id + 1
 	audioTmp    = cropFile + '.wav'
 	audioStart  = (track['frame'][0]) / 25
 	audioEnd    = (track['frame'][-1]+1) / 25
@@ -195,7 +220,7 @@ def crop_video(args, track, cropFile):
 			  (cropFile, audioTmp, args.nDataLoaderThread, cropFile)) # Combine audio and video file
 	output = subprocess.call(command, shell=True, stdout=None)
 	os.remove(cropFile + 't.avi')
-	return {'track':track, 'proc_track':dets}
+	return {'track':track, 'proc_track':dets, "tid":tid}
 
 def extract_MFCC(file, outPath):
 	# CPU: extract mfcc
@@ -262,7 +287,74 @@ def visualization(tracks, scores, args):
 		for fidx, frame in enumerate(track['track']['frame'].tolist()):
 			s = score[max(fidx - 2, 0): min(fidx + 3, len(score) - 1)] # average smoothing
 			s = numpy.mean(s)
-			faces[frame].append({'track':tidx, 'score':float(s),'s':track['proc_track']['s'][fidx], 'x':track['proc_track']['x'][fidx], 'y':track['proc_track']['y'][fidx]})
+			faces[frame].append({'track':track['tid'], 'score':float(s),'s':track['proc_track']['s'][fidx], 'x':track['proc_track']['x'][fidx], 'y':track['proc_track']['y'][fidx]})
+	speaker_track_ids = []
+	for frame in faces:
+		max_score = -100
+		speaker_track_id = -1
+		for i in range(len(frame)):
+			track = frame[i]
+			if track['score'] > max_score:
+				max_score = track['score']
+				speaker_track_id = track['track']
+		speaker_track_ids.append(speaker_track_id)
+	print("speaker_track_ids:", speaker_track_ids)
+	speaker_change_info = []
+	for i in range(len(speaker_track_ids)):
+		speaker_change_ts = {}
+		if i == 0:
+			speaker_change_ts['ts'] = i / 25.0
+			speaker_change_ts['tid'] = speaker_track_ids[i]
+			speaker_change_info.append(speaker_change_ts)
+			continue
+		if speaker_track_ids[i] != speaker_track_ids[i - 1]:
+			speaker_change_ts['ts'] = i / 25.0
+			speaker_change_ts['tid'] = speaker_track_ids[i]
+			speaker_change_info.append(speaker_change_ts)
+	for i in range(len(speaker_change_info)):
+		ts = speaker_change_info[i]['ts']
+		if i < len(speaker_change_info) - 1:
+			next_ts = speaker_change_info[i + 1]['ts']
+			speaker_change_info[i]['duration'] = (next_ts - ts)
+		else:
+			speaker_change_info[i]['duration'] = 100
+		speaker_change_info[i]['remove'] = False
+	min_unknown_dur = 0.5
+	print("speaker_change_info before remove short unknown slice:", speaker_change_info)
+	# remove unknwon slice shorter than 0.5 second
+	for i in range(len(speaker_change_info) - 1):
+		dur = speaker_change_info[i]['duration']
+		tid = speaker_change_info[i]['tid']
+		if i > 0 and tid == -1 and dur < min_unknown_dur:
+			speaker_change_info[i + 1]['ts'] = speaker_change_info[i + 1]['ts'] - dur / 2.0
+			speaker_change_info[i + 1]['duration'] = speaker_change_info[i + 1]['duration'] + dur / 2.0
+			speaker_change_info[i - 1]['duration'] = speaker_change_info[i - 1]['duration'] +  dur / 2.0
+			speaker_change_info[i]['remove'] = True
+	filtered_speaker_change_info = []
+	for item in speaker_change_info:
+		if not item['remove']:
+			filtered_speaker_change_info.append(item)
+	speaker_change_info = filtered_speaker_change_info
+	filtered_speaker_change_info = []
+	print("speaker_change_info after remove short unknown slice:", speaker_change_info)
+	# combine same speaker track
+	for i in range(len(speaker_change_info)):
+		prev_item = None
+		tid = speaker_change_info[i]['tid']
+		if i > 0:
+			prev_tid = speaker_change_info[i - 1]['tid']
+			print("cal sim:", tid, prev_tid)
+			if prev_tid != -1 and tid != -1 and face_similarity(args, prev_tid, tid) < 0.4:
+				speaker_change_info[i]['remove'] = True
+				speaker_change_info[i - 1]['duration'] = speaker_change_info[i - 1]['duration']  + speaker_change_info[i]['duration']
+	for item in speaker_change_info:
+		if not item['remove']:
+			filtered_speaker_change_info.append(item)
+	speaker_change_info = filtered_speaker_change_info 
+
+	print("final speaker_change_ts:", speaker_change_info)
+	return speaker_change_info
+
 	firstImage = cv2.imread(flist[0])
 	fw = firstImage.shape[1]
 	fh = firstImage.shape[0]
@@ -281,76 +373,10 @@ def visualization(tracks, scores, args):
 		(os.path.join(args.pyaviPath, 'video_only.avi'), os.path.join(args.pyaviPath, 'audio.wav'), \
 		args.nDataLoaderThread, os.path.join(args.pyaviPath,'video_out.avi'))) 
 	output = subprocess.call(command, shell=True, stdout=None)
-
-def evaluate_col_ASD(tracks, scores, args):
-	txtPath = args.videoFolder + '/col_labels/fusion/*.txt' # Load labels
-	predictionSet = {}
-	for name in {'long', 'bell', 'boll', 'lieb', 'sick', 'abbas'}:
-		predictionSet[name] = [[],[]]
-	dictGT = {}
-	txtFiles = glob.glob("%s"%txtPath)
-	for file in txtFiles:
-		lines = open(file).read().splitlines()
-		idName = file.split('/')[-1][:-4]
-		for line in lines:
-			data = line.split('\t')
-			frame = int(int(data[0]) / 29.97 * 25)
-			x1 = int(data[1])
-			y1 = int(data[2])
-			x2 = int(data[1]) + int(data[3])
-			y2 = int(data[2]) + int(data[3])
-			gt = int(data[4])
-			if frame in dictGT:
-				dictGT[frame].append([x1,y1,x2,y2,gt,idName])
-			else:
-				dictGT[frame] = [[x1,y1,x2,y2,gt,idName]]	
-	flist = glob.glob(os.path.join(args.pyframesPath, '*.jpg')) # Load files
-	flist.sort()
-	faces = [[] for i in range(len(flist))]
-	for tidx, track in enumerate(tracks):
-		score = scores[tidx]				
-		for fidx, frame in enumerate(track['track']['frame'].tolist()):
-			s = numpy.mean(score[max(fidx - 2, 0): min(fidx + 3, len(score) - 1)]) # average smoothing
-			faces[frame].append({'track':tidx, 'score':float(s),'s':track['proc_track']['s'][fidx], 'x':track['proc_track']['x'][fidx], 'y':track['proc_track']['y'][fidx]})
-	for fidx, fname in tqdm.tqdm(enumerate(flist), total = len(flist)):
-		if fidx in dictGT: # This frame has label
-			for gtThisFrame in dictGT[fidx]: # What this label is ?
-				faceGT = gtThisFrame[0:4]
-				labelGT = gtThisFrame[4]
-				idGT = gtThisFrame[5]
-				ious = []
-				for face in faces[fidx]: # Find the right face in my result
-					faceLocation = [int(face['x']-face['s']), int(face['y']-face['s']), int(face['x']+face['s']), int(face['y']+face['s'])]
-					faceLocation_new = [int(face['x']-face['s']) // 2, int(face['y']-face['s']) // 2, int(face['x']+face['s']) // 2, int(face['y']+face['s']) // 2]
-					iou = bb_intersection_over_union(faceLocation_new, faceGT, evalCol = True)
-					if iou > 0.5:
-						ious.append([iou, round(face['score'],2)])
-				if len(ious) > 0: # Find my result
-					ious.sort()
-					labelPredict = ious[-1][1]
-				else:					
-					labelPredict = 0
-				x1 = faceGT[0]
-				y1 = faceGT[1]
-				width = faceGT[2] - faceGT[0]
-				predictionSet[idGT][0].append(labelPredict)
-				predictionSet[idGT][1].append(labelGT)
-	names = ['long', 'bell', 'boll', 'lieb', 'sick', 'abbas'] # Evaluate
-	names.sort()
-	F1s = 0
-	for i in names:
-		scores = numpy.array(predictionSet[i][0])
-		labels = numpy.array(predictionSet[i][1])
-		scores = numpy.int64(scores > 0)
-		F1 = f1_score(labels, scores)
-		ACC = accuracy_score(labels, scores)
-		if i != 'abbas':
-			F1s += F1
-			print("%s, ACC:%.2f, F1:%.2f"%(i, 100 * ACC, 100 * F1))
-	print("Average F1:%.2f"%(100 * (F1s / 5)))	  
+	return speaker_change_ts
 
 # Main function
-def main():
+def main(input_args):
 	# This preprocesstion is modified based on this [repository](https://github.com/joonson/syncnet_python).
 	# ```
 	# .
@@ -377,82 +403,121 @@ def main():
 	# ```
 
 	# Initialization 
-	args.pyaviPath = os.path.join(args.savePath, 'pyavi')
-	args.pyframesPath = os.path.join(args.savePath, 'pyframes')
-	args.pyworkPath = os.path.join(args.savePath, 'pywork')
-	args.pycropPath = os.path.join(args.savePath, 'pycrop')
-	if os.path.exists(args.savePath):
-		rmtree(args.savePath)
-	os.makedirs(args.pyaviPath, exist_ok = True) # The path for the input video, input audio, output video
-	os.makedirs(args.pyframesPath, exist_ok = True) # Save all the video frames
-	os.makedirs(args.pyworkPath, exist_ok = True) # Save the results in this process by the pckl method
-	os.makedirs(args.pycropPath, exist_ok = True) # Save the detected face clips (audio+video) in this process
+	input_args.pyaviPath = os.path.join(input_args.savePath, 'pyavi')
+	input_args.pyframesPath = os.path.join(input_args.savePath, 'pyframes')
+	input_args.pyworkPath = os.path.join(input_args.savePath, 'pywork')
+	input_args.pycropPath = os.path.join(input_args.savePath, 'pycrop')
+	if os.path.exists(input_args.savePath):
+		rmtree(input_args.savePath)
+	os.makedirs(input_args.pyaviPath, exist_ok = True) # The path for the input video, input audio, output video
+	os.makedirs(input_args.pyframesPath, exist_ok = True) # Save all the video frames
+	os.makedirs(input_args.pyworkPath, exist_ok = True) # Save the results in this process by the pckl method
+	os.makedirs(input_args.pycropPath, exist_ok = True) # Save the detected face clips (audio+video) in this process
 
 	# Extract video
-	args.videoFilePath = os.path.join(args.pyaviPath, 'video.avi')
+	input_args.videoFilePath = os.path.join(input_args.pyaviPath, 'video.avi')
 	# If duration did not set, extract the whole video, otherwise extract the video from 'args.start' to 'args.start + args.duration'
-	if args.duration == 0:
+	if input_args.duration == 0:
 		command = ("ffmpeg -y -i %s -qscale:v 2 -threads %d -async 1 -r 25 %s -loglevel panic" % \
-			(args.videoPath, args.nDataLoaderThread, args.videoFilePath))
+			(input_args.videoPath, input_args.nDataLoaderThread, input_args.videoFilePath))
 	else:
 		command = ("ffmpeg -y -i %s -qscale:v 2 -threads %d -ss %.3f -to %.3f -async 1 -r 25 %s -loglevel panic" % \
-			(args.videoPath, args.nDataLoaderThread, args.start, args.start + args.duration, args.videoFilePath))
+			(input_args.videoPath, input_args.nDataLoaderThread, input_args.start, input_args.start + input_args.duration, input_args.videoFilePath))
 	subprocess.call(command, shell=True, stdout=None)
-	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Extract the video and save in %s \r\n" %(args.videoFilePath))
+	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Extract the video and save in %s \r\n" %(input_args.videoFilePath))
 	
 	# Extract audio
-	args.audioFilePath = os.path.join(args.pyaviPath, 'audio.wav')
+	input_args.audioFilePath = os.path.join(input_args.pyaviPath, 'audio.wav')
 	command = ("ffmpeg -y -i %s -qscale:a 0 -ac 1 -vn -threads %d -ar 16000 %s -loglevel panic" % \
-		(args.videoFilePath, args.nDataLoaderThread, args.audioFilePath))
+		(input_args.videoFilePath, input_args.nDataLoaderThread, input_args.audioFilePath))
 	subprocess.call(command, shell=True, stdout=None)
-	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Extract the audio and save in %s \r\n" %(args.audioFilePath))
+	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Extract the audio and save in %s \r\n" %(input_args.audioFilePath))
 
 	# Extract the video frames
 	command = ("ffmpeg -y -i %s -qscale:v 2 -threads %d -f image2 %s -loglevel panic" % \
-		(args.videoFilePath, args.nDataLoaderThread, os.path.join(args.pyframesPath, '%06d.jpg'))) 
+		(input_args.videoFilePath, input_args.nDataLoaderThread, os.path.join(input_args.pyframesPath, '%06d.jpg'))) 
 	subprocess.call(command, shell=True, stdout=None)
-	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Extract the frames and save in %s \r\n" %(args.pyframesPath))
+	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Extract the frames and save in %s \r\n" %(input_args.pyframesPath))
 
 	# Scene detection for the video frames
-	scene = scene_detect(args)
-	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Scene detection and save in %s \r\n" %(args.pyworkPath))	
+	scene = scene_detect(input_args)
+	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Scene detection and save in %s \r\n" %(input_args.pyworkPath))	
 
 	# Face detection for the video frames
-	faces = inference_video(args)
-	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Face detection and save in %s \r\n" %(args.pyworkPath))
+	faces = inference_video(input_args)
+	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Face detection and save in %s \r\n" %(input_args.pyworkPath))
+	print("scene[0]:", scene[0])
 
+	#print("faces:", faces)
 	# Face tracking
 	allTracks, vidTracks = [], []
 	for shot in scene:
-		if shot[1].frame_num - shot[0].frame_num >= args.minTrack: # Discard the shot frames less than minTrack frames
-			allTracks.extend(track_shot(args, faces[shot[0].frame_num:shot[1].frame_num])) # 'frames' to present this tracks' timestep, 'bbox' presents the location of the faces
+		print("shot[0]:",  shot[0])
+		print("shot[1]:",  shot[1])
+		if shot[1].frame_num - shot[0].frame_num >= input_args.minTrack: # Discard the shot frames less than minTrack frames
+			allTracks.extend(track_shot(input_args, faces[shot[0].frame_num:shot[1].frame_num])) # 'frames' to present this tracks' timestep, 'bbox' presents the location of the faces
 	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Face track and detected %d tracks \r\n" %len(allTracks))
-
+	#print("allTracks:", allTracks)
+	#格式： frame 编号， bbox： 脸的box 
 	# Face clips cropping
 	for ii, track in tqdm.tqdm(enumerate(allTracks), total = len(allTracks)):
-		vidTracks.append(crop_video(args, track, os.path.join(args.pycropPath, '%05d'%ii)))
-	savePath = os.path.join(args.pyworkPath, 'tracks.pckl')
+		track['tid'] = ii
+		vidTracks.append(crop_video(input_args, track, os.path.join(input_args.pycropPath, '%05d'%ii)))
+	savePath = os.path.join(input_args.pyworkPath, 'tracks.pckl')
 	with open(savePath, 'wb') as fil:
 		pickle.dump(vidTracks, fil)
-	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Face Crop and saved in %s tracks \r\n" %args.pycropPath)
+	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Face Crop and saved in %s tracks \r\n" %input_args.pycropPath)
 	fil = open(savePath, 'rb')
 	vidTracks = pickle.load(fil)
+	#print("vidTracks:", vidTracks)
 
 	# Active Speaker Detection by TalkNet
-	files = glob.glob("%s/*.avi"%args.pycropPath)
+	files = glob.glob("%s/*.avi"%input_args.pycropPath)
 	files.sort()
-	scores = evaluate_network(files, args)
-	savePath = os.path.join(args.pyworkPath, 'scores.pckl')
+	print("files:", files)
+	scores = evaluate_network(files, input_args)
+	savePath = os.path.join(input_args.pyworkPath, 'scores.pckl')
 	with open(savePath, 'wb') as fil:
 		pickle.dump(scores, fil)
-	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Scores extracted and saved in %s \r\n" %args.pyworkPath)
+	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Scores extracted and saved in %s \r\n" %input_args.pyworkPath)
+	speaker_change_ts = visualization(vidTracks, scores, input_args)	
+	return speaker_change_ts
 
-	if args.evalCol == True:
-		evaluate_col_ASD(vidTracks, scores, args) # The columnbia video is too big for visualization. You can still add the `visualization` funcition here if you want
-		quit()
-	else:
-		# Visualization, save the result as the new video	
-		visualization(vidTracks, scores, args)	
+def process(input_video):
+	new_args = init_args()
+	new_args.videoPath = input_video
+	new_args.videoFolder = "temp"
+	os.makedirs("temp", exist_ok=True)
+	new_args.savePath = os.path.join(new_args.videoFolder, "save_path")
+	print("new_args:", new_args)
+	speaker_change_ts = main(new_args)
+	output_video = new_args.savePath + "/pyavi/video_out.avi"
+	output_video = os.path.abspath(output_video)
+	print("output_video:", output_video)
+	return output_video, str(speaker_change_ts)
 
 if __name__ == '__main__':
-    main()
+	demo_inputs = [
+		gr.Video(
+			sources=["upload"],
+			label="Video File(5 seconds to 5 minutes)",
+			min_length=5,
+			max_length=300
+		),
+	]
+
+	demo_outputs = [
+		gr.Video(label="Returned Video", show_download_button=True),
+		gr.Textbox(
+			label="Speaker Change Timestamp",
+			type="text",
+		)
+	]
+
+	demo = gr.Interface(
+		fn=process,
+		inputs=demo_inputs,
+		outputs=demo_outputs,
+		title="Speaker Detection",
+	)
+	demo.launch(share=False, server_name="0.0.0.0", server_port=8087)
