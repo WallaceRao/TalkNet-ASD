@@ -16,6 +16,9 @@ from scenedetect.detectors import ContentDetector
 from model.faceDetector.s3fd import S3FD
 from talkNet import talkNet
 from deepface import DeepFace
+import threading
+import torch
+import gc
 
 warnings.filterwarnings("ignore")
 
@@ -25,7 +28,7 @@ parser.add_argument('--videoName',             type=str, default="001",   help='
 parser.add_argument('--videoFolder',           type=str, default="demo",  help='Path for inputs, tmps and outputs')
 parser.add_argument('--pretrainModel',         type=str, default="pretrain_TalkSet.model",   help='Path for the pretrained TalkNet model')
 
-parser.add_argument('--nDataLoaderThread',     type=int,   default=10,   help='Number of workers')
+parser.add_argument('--nDataLoaderThread',     type=int,   default=20,   help='Number of workers')
 parser.add_argument('--facedetScale',          type=float, default=0.25, help='Scale factor for face detection, the frames will be scale to 0.25 orig')
 parser.add_argument('--minTrack',              type=int,   default=10,   help='Number of min frames for each shot')
 parser.add_argument('--numFailedDet',          type=int,   default=10,   help='Number of missed detections allowed before tracking is stopped')
@@ -37,6 +40,31 @@ parser.add_argument('--duration',              type=int, default=0,  help='The d
 
 parser.add_argument('--evalCol',               dest='evalCol', action='store_true', help='Evaluate on Columnbia dataset')
 parser.add_argument('--colSavePath',           type=str, default="/data08/col",  help='Path for inputs, tmps and outputs')
+
+def release_cuda_memory():
+    device = torch.device('cuda:0')
+    free, total = torch.cuda.mem_get_info(device)
+    if (1.0 * free / total) < 0.2:
+        gc.collect()
+        torch.cuda.empty_cache()
+        new_free, total = torch.cuda.mem_get_info(device)
+        print("release cuda memory, size(MB):", (new_free - free)/1024.0/1024.0)
+
+class MyThread(threading.Thread):
+    def __init__(self, func, args=()):
+        super(MyThread, self).__init__()
+        self.func = func
+        self.args = args
+    def run(self):
+        self.result = self.func(*self.args)
+    def get_result(self):
+        threading.Thread.join(self)  # 等待线程执行完毕
+        try:
+            return self.result
+        except Exception:
+            return None
+ 
+
 
 def init_args():
 	args = parser.parse_args()
@@ -115,6 +143,30 @@ def inference_video(args):
 		pickle.dump(dets, fil)
 	return dets
 
+
+def batch_inference_video(args):
+	# GPU: Face detection, output is the list contains the face location and score in this frame
+	DET = S3FD(device='cuda')
+	flist = glob.glob(os.path.join(args.pyframesPath, '*.jpg'))
+	flist.sort()
+	dets = []
+	input_images = []
+	for fidx, fname in enumerate(flist):
+		image = cv2.imread(fname)
+		imageNumpy = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+		input_images.append(imageNumpy)
+	bboxes_array = DET.batch_detect_faces(input_images, conf_th=0.9, scale = args.facedetScale)
+	for fidx in range(len(bboxes_array)):
+		bboxes = bboxes_array[fidx]
+		dets.append([])
+		for bbox in bboxes:
+		  dets[-1].append({'frame':fidx, 'bbox':(bbox[:-1]).tolist(), 'conf':bbox[-1]}) # dets has the frames info, bbox info, conf info
+		sys.stderr.write('%s-%05d; %d dets\r' % (args.videoFilePath, fidx, len(dets[-1])))
+	savePath = os.path.join(args.pyworkPath,'faces.pckl')
+	with open(savePath, 'wb') as fil:
+		pickle.dump(dets, fil)
+	return dets
+
 def bb_intersection_over_union(boxA, boxB, evalCol = False):
 	# CPU: IOU Function to calculate overlap between two image
 	xA = max(boxA[0], boxB[0])
@@ -166,13 +218,29 @@ def track_shot(args, sceneFaces):
 
 def face_similarity(args, tid1, tid2):
 	total_sim = 0.0
+	models = [
+		"VGG-Face", 
+		"Facenet", 
+		"Facenet512", 
+		"OpenFace", 
+		"DeepFace", 
+		"DeepID", 
+		"ArcFace", 
+		"Dlib", 
+		"SFace",
+		"GhostFaceNet",
+	]
+
 	for face_id in range(3):
 		file_name1 = args.pycropPath + "/" + str(tid1) + "_" + str(face_id) + ".jpg"
 		file_name2 = args.pycropPath + "/" + str(tid2) + "_" + str(face_id) + ".jpg"
 		result = DeepFace.verify(
 			img1_path = file_name1,
 			img2_path = file_name2,
+			enforce_detection = False,
+			model_name = models[8],
 		)
+		print("result:", result)
 		total_sim = total_sim + result['distance']
 	return total_sim / 3.0
 
@@ -202,7 +270,15 @@ def crop_video(args, track, cropFile):
 		frame = numpy.pad(image, ((bsi,bsi), (bsi,bsi), (0, 0)), 'constant', constant_values=(110, 110))
 		my  = dets['y'][fidx] + bsi  # BBox center Y
 		mx  = dets['x'][fidx] + bsi  # BBox center X
-		face = frame[int(my-bs):int(my+bs*(1+2*cs)),int(mx-bs*(1+cs)):int(mx+bs*(1+cs))]
+		x1 =  int(my-bs)
+		x2 =  int(my+bs*(1+2*cs))
+		#if x1 > 10:
+		#	x1 = x1 - 10
+		y1 = int(mx-bs*(1+cs))
+		y2 = int(mx+bs*(1+cs))
+		#if y1 > 10:
+		#	y1 = y1 - 10
+		face = frame[x1:x2,y1:y2]
 		vOut.write(cv2.resize(face, (224, 224)))
 		if fidx in pick_indexs:
 			file_name = args.pycropPath + "/" + str(tid) + "_" + str(face_id) + ".jpg"
@@ -220,6 +296,7 @@ def crop_video(args, track, cropFile):
 			  (cropFile, audioTmp, args.nDataLoaderThread, cropFile)) # Combine audio and video file
 	output = subprocess.call(command, shell=True, stdout=None)
 	os.remove(cropFile + 't.avi')
+	print("crop video finished")
 	return {'track':track, 'proc_track':dets, "tid":tid}
 
 def extract_MFCC(file, outPath):
@@ -298,7 +375,6 @@ def visualization(tracks, scores, args):
 				max_score = track['score']
 				speaker_track_id = track['track']
 		speaker_track_ids.append(speaker_track_id)
-	print("speaker_track_ids:", speaker_track_ids)
 	speaker_change_info = []
 	for i in range(len(speaker_track_ids)):
 		speaker_change_ts = {}
@@ -343,7 +419,6 @@ def visualization(tracks, scores, args):
 		tid = speaker_change_info[i]['tid']
 		if i > 0:
 			prev_tid = speaker_change_info[i - 1]['tid']
-			print("cal sim:", tid, prev_tid)
 			if prev_tid != -1 and tid != -1 and face_similarity(args, prev_tid, tid) < 0.4:
 				speaker_change_info[i]['remove'] = True
 				speaker_change_info[i - 1]['duration'] = speaker_change_info[i - 1]['duration']  + speaker_change_info[i]['duration']
@@ -353,7 +428,7 @@ def visualization(tracks, scores, args):
 	speaker_change_info = filtered_speaker_change_info 
 
 	print("final speaker_change_ts:", speaker_change_info)
-	return speaker_change_info
+	#return speaker_change_info
 
 	firstImage = cv2.imread(flist[0])
 	fw = firstImage.shape[1]
@@ -373,7 +448,7 @@ def visualization(tracks, scores, args):
 		(os.path.join(args.pyaviPath, 'video_only.avi'), os.path.join(args.pyaviPath, 'audio.wav'), \
 		args.nDataLoaderThread, os.path.join(args.pyaviPath,'video_out.avi'))) 
 	output = subprocess.call(command, shell=True, stdout=None)
-	return speaker_change_ts
+	return speaker_change_info
 
 # Main function
 def main(input_args):
@@ -444,25 +519,43 @@ def main(input_args):
 	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Scene detection and save in %s \r\n" %(input_args.pyworkPath))	
 
 	# Face detection for the video frames
-	faces = inference_video(input_args)
+	faces = batch_inference_video(input_args)
 	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Face detection and save in %s \r\n" %(input_args.pyworkPath))
-	print("scene[0]:", scene[0])
 
 	#print("faces:", faces)
 	# Face tracking
 	allTracks, vidTracks = [], []
+	threads = []
 	for shot in scene:
-		print("shot[0]:",  shot[0])
-		print("shot[1]:",  shot[1])
+		if shot[1].frame_num - shot[0].frame_num >= input_args.minTrack: # Discard the shot frames less than minTrack frames
+			#allTracks.extend(track_shot(input_args, faces[shot[0].frame_num:shot[1].frame_num])) # 'frames' to present this tracks' timestep, 'bbox' presents the location of the faces
+			thread = MyThread(track_shot, (input_args, faces[shot[0].frame_num:shot[1].frame_num]))
+			thread.start()
+
+			threads.append(thread)
+	for i in range(len(threads)):
+		if threads[i].is_alive():
+			threads[i].join()
+		allTracks.extend(threads[i].get_result())
+
+	for shot in scene:
 		if shot[1].frame_num - shot[0].frame_num >= input_args.minTrack: # Discard the shot frames less than minTrack frames
 			allTracks.extend(track_shot(input_args, faces[shot[0].frame_num:shot[1].frame_num])) # 'frames' to present this tracks' timestep, 'bbox' presents the location of the faces
 	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Face track and detected %d tracks \r\n" %len(allTracks))
 	#print("allTracks:", allTracks)
 	#格式： frame 编号， bbox： 脸的box 
 	# Face clips cropping
-	for ii, track in tqdm.tqdm(enumerate(allTracks), total = len(allTracks)):
-		track['tid'] = ii
-		vidTracks.append(crop_video(input_args, track, os.path.join(input_args.pycropPath, '%05d'%ii)))
+	threads = [None] * len(allTracks)
+	vidTracks = [None] * len(allTracks)
+	for i in range(len(allTracks)):
+		allTracks[i]['tid'] = i
+		threads[i] = MyThread(crop_video, (input_args, allTracks[i], os.path.join(input_args.pycropPath, '%05d'%i)))
+		threads[i].start()
+	for i in range(len(threads)):
+		if threads[i].is_alive():
+			threads[i].join()
+		vidTracks[i] = threads[i].get_result()
+
 	savePath = os.path.join(input_args.pyworkPath, 'tracks.pckl')
 	with open(savePath, 'wb') as fil:
 		pickle.dump(vidTracks, fil)
@@ -484,6 +577,7 @@ def main(input_args):
 	return speaker_change_ts
 
 def process(input_video):
+	release_cuda_memory()
 	new_args = init_args()
 	new_args.videoPath = input_video
 	new_args.videoFolder = "temp"
@@ -494,6 +588,7 @@ def process(input_video):
 	output_video = new_args.savePath + "/pyavi/video_out.avi"
 	output_video = os.path.abspath(output_video)
 	print("output_video:", output_video)
+	release_cuda_memory()
 	return output_video, str(speaker_change_ts)
 
 if __name__ == '__main__':
