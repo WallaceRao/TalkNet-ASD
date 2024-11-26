@@ -19,6 +19,11 @@ from deepface import DeepFace
 import threading
 import torch
 import gc
+import uuid
+from datetime import datetime
+import json
+
+lock = threading.Lock()  
 
 warnings.filterwarnings("ignore")
 
@@ -30,7 +35,7 @@ parser.add_argument('--pretrainModel',         type=str, default="pretrain_TalkS
 
 parser.add_argument('--nDataLoaderThread',     type=int,   default=20,   help='Number of workers')
 parser.add_argument('--facedetScale',          type=float, default=0.25, help='Scale factor for face detection, the frames will be scale to 0.25 orig')
-parser.add_argument('--minTrack',              type=int,   default=10,   help='Number of min frames for each shot')
+parser.add_argument('--minTrack',              type=int,   default=15,   help='Number of min frames for each shot')
 parser.add_argument('--numFailedDet',          type=int,   default=10,   help='Number of missed detections allowed before tracking is stopped')
 parser.add_argument('--minFaceSize',           type=int,   default=1,    help='Minimum face size in pixels')
 parser.add_argument('--cropScale',             type=float, default=0.40, help='Scale bounding box')
@@ -40,6 +45,11 @@ parser.add_argument('--duration',              type=int, default=0,  help='The d
 
 parser.add_argument('--evalCol',               dest='evalCol', action='store_true', help='Evaluate on Columnbia dataset')
 parser.add_argument('--colSavePath',           type=str, default="/data08/col",  help='Path for inputs, tmps and outputs')
+
+
+PROCESS_FPS = 25
+#INTERMIDIATE_FOLDER = '/opt/oss/noiz_models/yonghui/talknet'
+INTERMIDIATE_FOLDER = './intermediate_result'
 
 def release_cuda_memory():
     device = torch.device('cuda:0')
@@ -249,7 +259,7 @@ def crop_video(args, track, cropFile):
 	# CPU: crop the face clips
 	flist = glob.glob(os.path.join(args.pyframesPath, '*.jpg')) # Read the frames
 	flist.sort()
-	vOut = cv2.VideoWriter(cropFile + 't.avi', cv2.VideoWriter_fourcc(*'XVID'), 25, (224,224))# Write video
+	vOut = cv2.VideoWriter(cropFile + '.avi', cv2.VideoWriter_fourcc(*'XVID'), PROCESS_FPS, (224,224))# Write video
 	dets = {'x':[], 'y':[], 's':[]}
 	for det in track['bbox']: # Read the tracks
 		dets['s'].append(max((det[3]-det[1]), (det[2]-det[0]))/2) 
@@ -261,7 +271,7 @@ def crop_video(args, track, cropFile):
 	total_frames = len(track['frame'])
 	tid = track['tid']
 	face_id = 0
-	pick_indexs = [int(total_frames/4.0), 2 * int(total_frames/4.0), 3 * int(total_frames/4.0)]
+	pick_step = int(total_frames/5.0)
 	for fidx, frame in enumerate(track['frame']):
 		cs  = args.cropScale
 		bs  = dets['s'][fidx]   # Detection box size
@@ -279,25 +289,30 @@ def crop_video(args, track, cropFile):
 		#if y1 > 10:
 		#	y1 = y1 - 10
 		face = frame[x1:x2,y1:y2]
+		if face.size <= 0:
+			continue
 		vOut.write(cv2.resize(face, (224, 224)))
-		if fidx in pick_indexs:
+		if fidx % pick_step == 0:
 			file_name = args.pycropPath + "/" + str(tid) + "_" + str(face_id) + ".jpg"
 			cv2.imwrite(file_name, face)
 			face_id = face_id + 1
+	
 	audioTmp    = cropFile + '.wav'
-	audioStart  = (track['frame'][0]) / 25
-	audioEnd    = (track['frame'][-1]+1) / 25
+	audioStart  = (track['frame'][0]) / PROCESS_FPS
+	audioEnd    = (track['frame'][-1]+1) / PROCESS_FPS
 	vOut.release()
+
 	command = ("ffmpeg -y -i %s -async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 -threads %d -ss %.3f -to %.3f %s -loglevel panic" % \
 		      (args.audioFilePath, args.nDataLoaderThread, audioStart, audioEnd, audioTmp)) 
 	output = subprocess.call(command, shell=True, stdout=None) # Crop audio file
+
 	_, audio = wavfile.read(audioTmp)
 	command = ("ffmpeg -y -i %st.avi -i %s -threads %d -c:v copy -c:a copy %s.avi -loglevel panic" % \
 			  (cropFile, audioTmp, args.nDataLoaderThread, cropFile)) # Combine audio and video file
 	output = subprocess.call(command, shell=True, stdout=None)
-	os.remove(cropFile + 't.avi')
-	print("crop video finished")
-	return {'track':track, 'proc_track':dets, "tid":tid}
+	#os.remove(cropFile + '.avi')
+	print("crop video finished and removed:", cropFile + '.avi')
+	return {'track':track, 'proc_track':dets, "tid":tid, "face_count":face_id}
 
 def extract_MFCC(file, outPath):
 	# CPU: extract mfcc
@@ -332,9 +347,9 @@ def evaluate_network(files, args):
 				break
 		video.release()
 		videoFeature = numpy.array(videoFeature)
-		length = min((audioFeature.shape[0] - audioFeature.shape[0] % 4) / 100, videoFeature.shape[0] / 25)
+		length = min((audioFeature.shape[0] - audioFeature.shape[0] % 4) / 100, videoFeature.shape[0] / PROCESS_FPS)
 		audioFeature = audioFeature[:int(round(length * 100)),:]
-		videoFeature = videoFeature[:int(round(length * 25)),:,:]
+		videoFeature = videoFeature[:int(round(length * PROCESS_FPS)),:,:]
 		allScore = [] # Evaluation use TalkNet
 		for duration in durationSet:
 			batchSize = int(math.ceil(length / duration))
@@ -342,7 +357,7 @@ def evaluate_network(files, args):
 			with torch.no_grad():
 				for i in range(batchSize):
 					inputA = torch.FloatTensor(audioFeature[i * duration * 100:(i+1) * duration * 100,:]).unsqueeze(0).cuda()
-					inputV = torch.FloatTensor(videoFeature[i * duration * 25: (i+1) * duration * 25,:,:]).unsqueeze(0).cuda()
+					inputV = torch.FloatTensor(videoFeature[i * duration * PROCESS_FPS: (i+1) * duration * PROCESS_FPS,:,:]).unsqueeze(0).cuda()
 					embedA = s.model.forward_audio_frontend(inputA)
 					embedV = s.model.forward_visual_frontend(inputV)	
 					embedA, embedV = s.model.forward_cross_attention(embedA, embedV)
@@ -354,7 +369,7 @@ def evaluate_network(files, args):
 		allScores.append(allScore)	
 	return allScores
 
-def visualization(tracks, scores, args):
+def visualization(tracks, scores, args, return_timestamp_only):
 	# CPU: visulize the result for video format
 	flist = glob.glob(os.path.join(args.pyframesPath, '*.jpg'))
 	flist.sort()
@@ -379,12 +394,12 @@ def visualization(tracks, scores, args):
 	for i in range(len(speaker_track_ids)):
 		speaker_change_ts = {}
 		if i == 0:
-			speaker_change_ts['ts'] = i / 25.0
+			speaker_change_ts['ts'] = i / float(PROCESS_FPS)
 			speaker_change_ts['tid'] = speaker_track_ids[i]
 			speaker_change_info.append(speaker_change_ts)
 			continue
 		if speaker_track_ids[i] != speaker_track_ids[i - 1]:
-			speaker_change_ts['ts'] = i / 25.0
+			speaker_change_ts['ts'] = i / float(PROCESS_FPS)
 			speaker_change_ts['tid'] = speaker_track_ids[i]
 			speaker_change_info.append(speaker_change_ts)
 	for i in range(len(speaker_change_info)):
@@ -426,14 +441,14 @@ def visualization(tracks, scores, args):
 		if not item['remove']:
 			filtered_speaker_change_info.append(item)
 	speaker_change_info = filtered_speaker_change_info 
-
 	print("final speaker_change_ts:", speaker_change_info)
-	#return speaker_change_info
-
+	speaker_change_info = json.dumps(speaker_change_info)
+	if return_timestamp_only:
+		return speaker_change_info
 	firstImage = cv2.imread(flist[0])
 	fw = firstImage.shape[1]
 	fh = firstImage.shape[0]
-	vOut = cv2.VideoWriter(os.path.join(args.pyaviPath, 'video_only.avi'), cv2.VideoWriter_fourcc(*'XVID'), 25, (fw,fh))
+	vOut = cv2.VideoWriter(os.path.join(args.pyaviPath, 'video_only.avi'), cv2.VideoWriter_fourcc(*'XVID'), PROCESS_FPS, (fw,fh))
 	colorDict = {0: 0, 1: 255}
 	for fidx, fname in tqdm.tqdm(enumerate(flist), total = len(flist)):
 		image = cv2.imread(fname)
@@ -451,7 +466,7 @@ def visualization(tracks, scores, args):
 	return speaker_change_info
 
 # Main function
-def main(input_args):
+def main(input_args, return_timestamp_only):
 	# This preprocesstion is modified based on this [repository](https://github.com/joonson/syncnet_python).
 	# ```
 	# .
@@ -493,10 +508,10 @@ def main(input_args):
 	input_args.videoFilePath = os.path.join(input_args.pyaviPath, 'video.avi')
 	# If duration did not set, extract the whole video, otherwise extract the video from 'args.start' to 'args.start + args.duration'
 	if input_args.duration == 0:
-		command = ("ffmpeg -y -i %s -qscale:v 2 -threads %d -async 1 -r 25 %s -loglevel panic" % \
+		command = (f"ffmpeg -y -i %s -qscale:v 2 -threads %d -async 1 -r {PROCESS_FPS} %s -loglevel panic" % \
 			(input_args.videoPath, input_args.nDataLoaderThread, input_args.videoFilePath))
 	else:
-		command = ("ffmpeg -y -i %s -qscale:v 2 -threads %d -ss %.3f -to %.3f -async 1 -r 25 %s -loglevel panic" % \
+		command = (f"ffmpeg -y -i %s -qscale:v 2 -threads %d -ss %.3f -to %.3f -async 1 -r {PROCESS_FPS} %s -loglevel panic" % \
 			(input_args.videoPath, input_args.nDataLoaderThread, input_args.start, input_args.start + input_args.duration, input_args.videoFilePath))
 	subprocess.call(command, shell=True, stdout=None)
 	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Extract the video and save in %s \r\n" %(input_args.videoFilePath))
@@ -531,7 +546,6 @@ def main(input_args):
 			#allTracks.extend(track_shot(input_args, faces[shot[0].frame_num:shot[1].frame_num])) # 'frames' to present this tracks' timestep, 'bbox' presents the location of the faces
 			thread = MyThread(track_shot, (input_args, faces[shot[0].frame_num:shot[1].frame_num]))
 			thread.start()
-
 			threads.append(thread)
 	for i in range(len(threads)):
 		if threads[i].is_alive():
@@ -546,7 +560,7 @@ def main(input_args):
 	#格式： frame 编号， bbox： 脸的box 
 	# Face clips cropping
 	threads = [None] * len(allTracks)
-	vidTracks = [None] * len(allTracks)
+	vidTracks = []
 	for i in range(len(allTracks)):
 		allTracks[i]['tid'] = i
 		threads[i] = MyThread(crop_video, (input_args, allTracks[i], os.path.join(input_args.pycropPath, '%05d'%i)))
@@ -554,7 +568,9 @@ def main(input_args):
 	for i in range(len(threads)):
 		if threads[i].is_alive():
 			threads[i].join()
-		vidTracks[i] = threads[i].get_result()
+		vid_track =  threads[i].get_result()
+		if vid_track['face_count'] >= 3:
+			vidTracks.append(vid_track)
 
 	savePath = os.path.join(input_args.pyworkPath, 'tracks.pckl')
 	with open(savePath, 'wb') as fil:
@@ -573,23 +589,31 @@ def main(input_args):
 	with open(savePath, 'wb') as fil:
 		pickle.dump(scores, fil)
 	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Scores extracted and saved in %s \r\n" %input_args.pyworkPath)
-	speaker_change_ts = visualization(vidTracks, scores, input_args)	
+	speaker_change_ts = visualization(vidTracks, scores, input_args, return_timestamp_only)	
 	return speaker_change_ts
 
-def process(input_video):
-	release_cuda_memory()
-	new_args = init_args()
-	new_args.videoPath = input_video
-	new_args.videoFolder = "temp"
-	os.makedirs("temp", exist_ok=True)
-	new_args.savePath = os.path.join(new_args.videoFolder, "save_path")
-	print("new_args:", new_args)
-	speaker_change_ts = main(new_args)
-	output_video = new_args.savePath + "/pyavi/video_out.avi"
-	output_video = os.path.abspath(output_video)
-	print("output_video:", output_video)
-	release_cuda_memory()
-	return output_video, str(speaker_change_ts)
+def process(input_video, return_timestamp_only):
+	with lock:
+		release_cuda_memory()
+		new_args = init_args()
+		new_args.videoPath = input_video
+
+		temp_folder = datetime.today().strftime('%Y-%m-%d_%H-%M-%S')
+		lowercase_str = uuid.uuid4().hex[0:6]
+		save_path = INTERMIDIATE_FOLDER + "/" + temp_folder + "_" + lowercase_str
+
+		new_args.videoFolder = save_path
+		os.makedirs(save_path, exist_ok=True)
+		new_args.savePath = new_args.videoFolder #os.path.join(new_args.videoFolder, "save_path")
+		print("new_args:", new_args)
+		speaker_change_ts = main(new_args, return_timestamp_only)
+		output_video = new_args.savePath + "/pyavi/video_out.avi"
+		output_video = os.path.abspath(output_video)
+		print("output_video:", output_video)
+		release_cuda_memory()
+		if return_timestamp_only:
+			return None, str(speaker_change_ts)
+		return output_video, str(speaker_change_ts)
 
 if __name__ == '__main__':
 	demo_inputs = [
@@ -598,6 +622,12 @@ if __name__ == '__main__':
 			label="Video File(5 seconds to 5 minutes)",
 			min_length=5,
 			max_length=300
+		),
+		gr.Dropdown(choices=[
+						('No', 0), 
+						('YES', 1)], 
+					value=1, 
+					label="only return timestamp, without video"
 		),
 	]
 
