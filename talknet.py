@@ -48,6 +48,7 @@ parser.add_argument('--colSavePath',           type=str, default="/data08/col", 
 
 
 PROCESS_FPS = 25
+MODEL_PROCESS_FPS = 25
 #INTERMIDIATE_FOLDER = '/opt/oss/noiz_models/yonghui/talknet'
 INTERMIDIATE_FOLDER = './intermediate_result'
 
@@ -259,7 +260,7 @@ def crop_video(args, track, cropFile):
 	# CPU: crop the face clips
 	flist = glob.glob(os.path.join(args.pyframesPath, '*.jpg')) # Read the frames
 	flist.sort()
-	vOut = cv2.VideoWriter(cropFile + '.avi', cv2.VideoWriter_fourcc(*'XVID'), PROCESS_FPS, (224,224))# Write video
+	vOut = cv2.VideoWriter(cropFile + '_t.avi', cv2.VideoWriter_fourcc(*'XVID'), PROCESS_FPS, (224,224))# Write video
 	dets = {'x':[], 'y':[], 's':[]}
 	for det in track['bbox']: # Read the tracks
 		dets['s'].append(max((det[3]-det[1]), (det[2]-det[0]))/2) 
@@ -302,16 +303,25 @@ def crop_video(args, track, cropFile):
 	audioEnd    = (track['frame'][-1]+1) / PROCESS_FPS
 	vOut.release()
 
+
 	command = ("ffmpeg -y -i %s -async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 -threads %d -ss %.3f -to %.3f %s -loglevel panic" % \
 		      (args.audioFilePath, args.nDataLoaderThread, audioStart, audioEnd, audioTmp)) 
 	output = subprocess.call(command, shell=True, stdout=None) # Crop audio file
 
 	_, audio = wavfile.read(audioTmp)
-	command = ("ffmpeg -y -i %st.avi -i %s -threads %d -c:v copy -c:a copy %s.avi -loglevel panic" % \
+	command = ("ffmpeg -y -i %s_t.avi -i %s -threads %d -c:v copy -c:a copy %s_t2.avi -loglevel panic" % \
 			  (cropFile, audioTmp, args.nDataLoaderThread, cropFile)) # Combine audio and video file
 	output = subprocess.call(command, shell=True, stdout=None)
+
+	command = (f"ffmpeg -i %s_t2.avi -i %s -threads %d  -filter:0 \"minterpolate='fps={MODEL_PROCESS_FPS}'\" %s.avi -loglevel panic" % \
+			  (cropFile, audioTmp, args.nDataLoaderThread, cropFile)) # Combine audio and video file
+	output = subprocess.call(command, shell=True, stdout=None)
+
+
+	os.remove(cropFile + '_t.avi')
+	os.remove(cropFile + '_t2.avi')
 	#os.remove(cropFile + '.avi')
-	print("crop video finished and removed:", cropFile + '.avi')
+	#print("crop video finished and removed:", cropFile + '.avi')
 	return {'track':track, 'proc_track':dets, "tid":tid, "face_count":face_id}
 
 def extract_MFCC(file, outPath):
@@ -347,9 +357,9 @@ def evaluate_network(files, args):
 				break
 		video.release()
 		videoFeature = numpy.array(videoFeature)
-		length = min((audioFeature.shape[0] - audioFeature.shape[0] % 4) / 100, videoFeature.shape[0] / PROCESS_FPS)
+		length = min((audioFeature.shape[0] - audioFeature.shape[0] % 4) / 100, videoFeature.shape[0] / MODEL_PROCESS_FPS)
 		audioFeature = audioFeature[:int(round(length * 100)),:]
-		videoFeature = videoFeature[:int(round(length * PROCESS_FPS)),:,:]
+		videoFeature = videoFeature[:int(round(length * MODEL_PROCESS_FPS)),:,:]
 		allScore = [] # Evaluation use TalkNet
 		for duration in durationSet:
 			batchSize = int(math.ceil(length / duration))
@@ -357,7 +367,7 @@ def evaluate_network(files, args):
 			with torch.no_grad():
 				for i in range(batchSize):
 					inputA = torch.FloatTensor(audioFeature[i * duration * 100:(i+1) * duration * 100,:]).unsqueeze(0).cuda()
-					inputV = torch.FloatTensor(videoFeature[i * duration * PROCESS_FPS: (i+1) * duration * PROCESS_FPS,:,:]).unsqueeze(0).cuda()
+					inputV = torch.FloatTensor(videoFeature[i * duration * MODEL_PROCESS_FPS: (i+1) * duration * MODEL_PROCESS_FPS,:,:]).unsqueeze(0).cuda()
 					embedA = s.model.forward_audio_frontend(inputA)
 					embedV = s.model.forward_visual_frontend(inputV)	
 					embedA, embedV = s.model.forward_cross_attention(embedA, embedV)
